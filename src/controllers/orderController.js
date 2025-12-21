@@ -1,19 +1,24 @@
 import pool from "../config/database.js";
 
+const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 const validateOrderData = (data) => {
   const errors = [];
 
   if (!data.totalAmount || data.totalAmount <= 0) {
-    errors.push("totalAmount is required and must be greater than 0");
+    errors.push("Ttotal amount is required and must be greater than 0");
   }
 
   if (!data.items || !Array.isArray(data.items) || data.items.length === 0) {
-    errors.push("items must be a non-empty array");
+    errors.push("Items must be a non-empty array");
   } else {
     data.items.forEach((item, index) => {
-      if (!item.listingId) errors.push(`Item ${index + 1}: listingId is required`);
-      if (!item.quantity || item.quantity <= 0) errors.push(`Item ${index + 1}: quantity must be greater than 0`);
-      if (!item.unit_price || item.unit_price <= 0) errors.push(`Item ${index + 1}: unit_price must be greater than 0`);
+      if (!item.listingId)
+        errors.push(`Item ${index + 1}: listingId is required`);
+      if (!item.quantity || item.quantity <= 0)
+        errors.push(`Item ${index + 1}: quantity must be greater than 0`);
+      if (!item.unit_price || item.unit_price <= 0)
+        errors.push(`Item ${index + 1}: unit_price must be greater than 0`);
     });
   }
 
@@ -25,89 +30,165 @@ export const createOrder = async (req, res) => {
   try {
     const {
       userId,
-      sellerId,
       totalAmount,
       currency = "USD",
-      status = "pending",
-      isGuest = false,
       shippingAddressId,
-      billingAddressId,
       items,
     } = req.body;
+    const isGuest = !userId;
 
+    //validation
 
-    const validationErrors = validateOrderData({ totalAmount, items });
+    const validationErrors = validateOrderData(req.body)
+
     if (validationErrors.length > 0) {
-      return res.status(400).json({
-        error: "Validation failed",
-        details: validationErrors
-      });
+      return res.status(400).json({ errors: validationErrors })
     }
 
+    if (!shippingAddressId) {
+      return res.status(400).json({ error: "No shipping address" });
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Items are required" });
+    }
+
+    // validate items
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (!item.listingId)
+        return res
+          .status(400)
+          .json({ error: `The item ${i + 1} have no listing Id` });
+      if (!item.quantity || item.quantity <= 0)
+        return res
+          .status(400)
+          .json({ error: `The item ${i + 1} have no quantity` });
+      if (!item.unit_price || item.unit_price <= 0)
+        return res
+          .status(400)
+          .json({ error: `The item ${i + 1} have no unit price` });
+    }
+
+    const shippingAddressCheck = await client.query(
+      `SELECT address_id from addresses where address_id = $1`,
+      [shippingAddressId]
+    );
+    if (shippingAddressCheck.rows.length === 0) {
+      return res
+        .status(400)
+        .json({ message: "Shipping address not found" })
+    }
     await client.query("BEGIN");
+    const insertOrderQuery = await client.query(
+      `INSERT INTO orders (user_id,total_amount,currency,status,shipping_address_id,is_guest) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [
+        userId || null,
+        totalAmount,
+        currency,
+        "pending",
+        shippingAddressId,
+        isGuest,
+      ]
+    );
 
-    const orderQuery = `
-      INSERT INTO orders 
-      (user_id, seller_id, total_amount, currency, status, shipping_address_id, billing_address_id, is_guest)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING *;
-    `;
+    const orderQueryResults = insertOrderQuery.rows[0];
+    const insertOrderItemQuery = `INSERT INTO order_items (order_id,listing_id,quantity,unit_price,total_price) VALUES($1,$2,$3,$4,$5) RETURNING *`;
+    const businessMapping = {};
 
-    const { rows: orderRows } = await client.query(orderQuery, [
-      userId || null,
-      sellerId || null,
-      totalAmount,
-      currency,
-      status,
-      shippingAddressId || null,
-      billingAddressId || null,
-      isGuest,
-    ]);
+    //validate price from order and real total
 
-    const order = orderRows[0];
-
-    const orderItemsQuery = `
-      INSERT INTO order_items (order_id, listing_id, sku_item_id, quantity, unit_price, total_price)
-      VALUES ($1, $2, $3, $4, $5, $6)
-      RETURNING *;
-    `;
-
-    const orderItems = [];
+    let serverTotal = 0;
     for (const item of items) {
-      const total_price = item.quantity * item.unit_price;
-      const { rows } = await client.query(orderItemsQuery, [
-        order.order_id,
+      const listingQuery = `SELECT listings_id,title,business_id,price,stock from listings where listings_id = $1 FOR UPDATE`;
+      const listingQueryResult = await client.query(listingQuery, [
         item.listingId,
-        item.sku_item_id || null,
+      ]);
+
+      if (listingQueryResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "No such product" });
+      }
+
+      const listing = listingQueryResult.rows[0];
+      if (listing.stock < item.quantity) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Insufficient products" });
+      }
+
+      const realProductPrice = Number(listing.price);
+      if (Math.abs(realProductPrice - Number(item.unit_price)) > 0.01) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Price mismatch" });
+      }
+
+      // insert order Items
+      const totalPrice = realProductPrice * item.quantity;
+      serverTotal += totalPrice
+      const orderItems = await client.query(insertOrderItemQuery, [
+        orderQueryResults.order_id,
+        item.listingId,
         item.quantity,
         item.unit_price,
-        item.total_price,
-        total_price
+        totalPrice,
       ]);
-      orderItems.push(rows[0]);
+
+      // deduct some products from stock
+      await client.query(
+        `UPDATE listings SET stock = stock - $1 WHERE listings_id = $2`,
+        [item.quantity, item.listingId]
+      );
+
+      // bussinessMapping
+      const businessId = listing.business_id
+
+      if (!businessMapping[businessId]) {
+        businessMapping[businessId] = { totalAmount: 0, items: [] }
+      }
+
+      businessMapping[businessId].items.push({
+        order_item_id: orderItems.rows[0].order_item_id,
+        listing_id: listing.listings_id,
+        quantity: item.quantity,
+        unit_price: realProductPrice,
+        total_price: totalPrice,
+        listing_title: listing.title
+      })
+      businessMapping[businessId].total_amount += totalPrice
     }
 
-    await client.query("COMMIT");
+    //Update order total with server-calculated amount
+    await client.query(`UPDATE orders SET total_amount = $1 WHERE order_id = $2`, [serverTotal, orderQueryResults.order_id])
 
-    res.status(201).json({ order, orderItems });
+    await client.query("COMMIT")
+    return res.status(201).json({
+      message: "Order created successfully. Proceed to payment",
+      orderId: orderQueryResults.order_id,
+      orderQueryResults,
+      businessMapping
+    })
   } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("Error creating order:", error);
-    res.status(500).json({ error: "Internal server error" });
+    await client.query("ROLLBACK")
+    res.status(500).json({ message: "Internal server error" })
   } finally {
-    client.release();
+    client.release()
   }
 };
 
 export const getOrders = async (req, res) => {
   try {
     const { userId, sellerId, status } = req.query;
-    let query = `
-      SELECT o.*, u.username AS buyer, s.username AS seller
+    const query = `
+      SELECT o.*, u.full_name AS buyer, s.full_name AS seller,
+      (SELECT json_agg(json_build_object('listing_title', l.title, 'quantity', oi.quantity)) 
+       FROM order_items oi 
+       JOIN listings l ON oi.listing_id = l.listings_id 
+       WHERE oi.order_id = o.order_id) as items
       FROM orders o 
       LEFT JOIN users u ON o.user_id = u.user_id
       LEFT JOIN users s ON o.seller_id = s.user_id
-    `;
+      `;
     const params = [];
     const conditions = [];
 
@@ -144,26 +225,27 @@ export const getOrderById = async (req, res) => {
   try {
     const { id } = req.params;
 
-    if (!id || isNaN(id)) {
+    if (!id || !uuidRegex.test(id)) {
       return res.status(400).json({ error: "Invalid order ID" });
     }
 
     const orderQuery = `
-      SELECT o.*, u.username AS buyer, s.username AS seller
+      SELECT o.*, u.full_name AS buyer, s.full_name AS seller
       FROM orders o
       LEFT JOIN users u ON o.user_id = u.user_id
       LEFT JOIN users s ON o.seller_id = s.user_id
       WHERE o.order_id = $1
-    `;
+      `;
     const { rows: orderRows } = await pool.query(orderQuery, [id]);
-    if (orderRows.length === 0) return res.status(404).json({ error: "Order not found" });
+    if (orderRows.length === 0)
+      return res.status(404).json({ error: "Order not found" });
 
     const itemsQuery = `
       SELECT oi.*, l.title as listing_title
       FROM order_items oi
-      LEFT JOIN listings l ON oi.listing_id = l.listing_id
+      LEFT JOIN listings l ON oi.listing_id = l.listings_id
       WHERE oi.order_id = $1
-    `;
+      `;
     const { rows: items } = await pool.query(itemsQuery, [id]);
 
     res.json({ ...orderRows[0], items });
@@ -176,21 +258,22 @@ export const getOrderById = async (req, res) => {
 export const updateOrder = async (req, res) => {
   try {
     const { id } = req.params;
-    const { totalAmount, shippingAddressId, billingAddressId, status } = req.body;
+    const { totalAmount, shippingAddressId, billingAddressId, status } =
+      req.body;
 
-    if (!id || isNaN(id)) {
+    if (!id || !uuidRegex.test(id)) {
       return res.status(400).json({ error: "Invalid order ID" });
     }
 
     const query = `
       UPDATE orders
       SET total_amount = COALESCE($1, total_amount),
-          shipping_address_id = COALESCE($2, shipping_address_id),
-          billing_address_id = COALESCE($3, billing_address_id),
-          status = COALESCE($4, status),
-          updated_at = NOW()
+      shipping_address_id = COALESCE($2, shipping_address_id),
+      billing_address_id = COALESCE($3, billing_address_id),
+      status = COALESCE($4, status),
+      updated_at = NOW()
       WHERE order_id = $5
-      RETURNING *;
+    RETURNING *;
     `;
 
     const { rows } = await pool.query(query, [
@@ -201,7 +284,8 @@ export const updateOrder = async (req, res) => {
       id,
     ]);
 
-    if (rows.length === 0) return res.status(404).json({ error: "Order not found" });
+    if (rows.length === 0)
+      return res.status(404).json({ error: "Order not found" });
 
     res.json(rows[0]);
   } catch (error) {
@@ -214,12 +298,16 @@ export const deleteOrder = async (req, res) => {
   try {
     const { id } = req.params;
 
-    if (!id || isNaN(id)) {
+    if (!id || !uuidRegex.test(id)) {
       return res.status(400).json({ error: "Invalid order ID" });
     }
 
-    const { rowCount } = await pool.query("DELETE FROM orders WHERE order_id = $1", [id]);
-    if (rowCount === 0) return res.status(404).json({ error: "Order not found" });
+    const { rowCount } = await pool.query(
+      "DELETE FROM orders WHERE order_id = $1",
+      [id]
+    );
+    if (rowCount === 0)
+      return res.status(404).json({ error: "Order not found" });
 
     res.json({ message: "Order deleted successfully" });
   } catch (error) {
@@ -243,15 +331,15 @@ export const getOrderStats = async (req, res) => {
     }
 
     const statsQuery = `
-      SELECT 
-        COUNT(*) as total_orders,
-        COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_orders,
-        COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed_orders,
-        COUNT(CASE WHEN status = 'cancelled' THEN 1 END) as cancelled_orders,
-        COALESCE(SUM(total_amount), 0) as total_revenue,
-        COALESCE(AVG(total_amount), 0) as average_order_value
+    SELECT
+    COUNT(*) as total_orders,
+      COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_orders,
+      COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed_orders,
+      COUNT(CASE WHEN status = 'cancelled' THEN 1 END) as cancelled_orders,
+      COALESCE(SUM(total_amount), 0) as total_revenue,
+      COALESCE(AVG(total_amount), 0) as average_order_value
       FROM orders 
-      ${whereClause}
+      ${ whereClause }
     `;
 
     const { rows } = await pool.query(statsQuery, params);
